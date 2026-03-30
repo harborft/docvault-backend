@@ -31,11 +31,12 @@ async function requireAuth(req, res, next) {
 
     req.user    = user;
     req.profile = profile;
-    next();
   } catch (err) {
     logger.error('Auth middleware error', { error: err.message });
-    res.status(500).json({ error: 'Authentication error' });
+    return res.status(500).json({ error: 'Authentication error' });
   }
+
+  next();
 }
 
 // Only allows admin users through

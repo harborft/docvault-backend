@@ -16,6 +16,9 @@ const auditRoutes     = require('./routes/audit');
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
+// Enable 'trust proxy' so rate limiters inside cloud environments do not block the load balancer IP
+app.set('trust proxy', 1);
+
 // ── Security headers
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' }
@@ -46,7 +49,8 @@ const authLimiter = rateLimit({
 });
 
 app.use('/api', generalLimiter);
-app.use('/api/auth', authLimiter);
+// app.use('/api/auth', authLimiter); // Removed because this globally limits `/api/auth/me` to 10 requests / 15 mins
+
 
 // ── Body parsing
 app.use(express.json({ limit: '10mb' }));
