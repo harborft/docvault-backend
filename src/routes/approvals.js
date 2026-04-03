@@ -1,30 +1,37 @@
 // routes/approvals.js
 const express  = require('express');
 const supabase = require('../config/supabase');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requireRole } = require('../middleware/auth');
+const logger   = require('../utils/logger');
+const { scopeToAssigned, getAssignedClientIds } = require('../utils/scope');
 const router   = express.Router();
 
-// All pending documents, newest first
-router.get('/', requireAuth, requireAdmin, async (req, res) => {
+// Pending documents — scoped to assigned clients for non-owners
+router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from('documents')
       .select('*, clients(name), folders(name), profiles!uploaded_by(full_name)')
       .in('status', ['pending', 'in_review', 'flagged'])
       .order('created_at', { ascending: false });
+    query = await scopeToAssigned(query, req.user.id, req.profile.role);
+    const { data, error } = await query;
     if (error) throw error;
     res.json({ documents: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logger.error('List approvals error', { error: err.message }); res.status(500).json({ error: 'Failed to list pending documents' }); }
 });
 
-// Stats for dashboard
-router.get('/stats', requireAuth, requireAdmin, async (req, res) => {
+// Stats for dashboard — scoped to assigned clients for non-owners
+router.get('/stats', requireAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
+    const clientIds = await getAssignedClientIds(req.user.id, req.profile.role);
+    const addScope = (q) => clientIds ? q.in('client_id', clientIds) : q;
+
     const [pending, approved, flagged, total] = await Promise.all([
-      supabase.from('documents').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
-      supabase.from('documents').select('id', { count: 'exact', head: true }).eq('status', 'approved'),
-      supabase.from('documents').select('id', { count: 'exact', head: true }).eq('status', 'flagged'),
-      supabase.from('documents').select('id', { count: 'exact', head: true })
+      addScope(supabase.from('documents').select('id', { count: 'exact', head: true }).eq('status', 'pending')),
+      addScope(supabase.from('documents').select('id', { count: 'exact', head: true }).eq('status', 'approved')),
+      addScope(supabase.from('documents').select('id', { count: 'exact', head: true }).eq('status', 'flagged')),
+      addScope(supabase.from('documents').select('id', { count: 'exact', head: true }))
     ]);
     res.json({
       pending:  pending.count  || 0,
@@ -32,7 +39,7 @@ router.get('/stats', requireAuth, requireAdmin, async (req, res) => {
       flagged:  flagged.count  || 0,
       total:    total.count    || 0
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logger.error('Approval stats error', { error: err.message }); res.status(500).json({ error: 'Failed to load stats' }); }
 });
 
 module.exports = router;

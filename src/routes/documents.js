@@ -14,9 +14,11 @@ const multer   = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('../config/supabase');
 const graph    = require('../config/graph');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requireRole } = require('../middleware/auth');
 const { logAction } = require('../utils/audit');
 const logger   = require('../utils/logger');
+const { scopeToAssigned, hasClientAccess } = require('../utils/scope');
+const { validateQuery, validateParams, idParam, documentListQuery, updateStatusBody, validate } = require('../utils/validation');
 
 const router = express.Router();
 
@@ -39,23 +41,21 @@ const upload = multer({
 });
 
 // ── GET /api/documents
-router.get('/', requireAuth, async (req, res) => {
+// All roles can list documents — scoped to their assigned clients
+router.get('/', requireAuth, validateQuery(documentListQuery), async (req, res) => {
   try {
-    const { client_id, folder_id, status, limit = 50, offset = 0 } = req.query;
+    const { client_id, folder_id, status, limit, offset } = req.query;
 
     let query = supabase
       .from('documents')
       .select('*, clients(name), folders(name), profiles!uploaded_by(full_name)')
       .order('created_at', { ascending: false })
-      .range(Number(offset), Number(offset) + Number(limit) - 1);
+      .range(offset, offset + limit - 1);
 
-    if (req.profile.role === 'client') {
-      const { data: cu } = await supabase
-        .from('client_users').select('client_id').eq('user_id', req.user.id);
-      query = query.in('client_id', cu?.map(r => r.client_id) || []);
-    } else if (client_id) {
-      query = query.eq('client_id', client_id);
-    }
+    // Scope to assigned clients
+    query = await scopeToAssigned(query, req.user.id, req.profile.role);
+
+    if (client_id) query = query.eq('client_id', client_id);
 
     if (folder_id) query = query.eq('folder_id', folder_id);
     if (status)    query = query.eq('status', status);
@@ -65,24 +65,22 @@ router.get('/', requireAuth, async (req, res) => {
     res.json({ documents: data });
   } catch (err) {
     logger.error('List documents error', { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Failed to list documents' });
   }
 });
 
 // ── POST /api/documents/upload
-router.post('/upload', requireAuth, upload.array('files'), async (req, res) => {
+// All roles except readonly_reviewer can upload
+router.post('/upload', requireAuth, requireRole('owner', 'manager', 'staff_accountant', 'client'), upload.array('files'), async (req, res) => {
   try {
     const { client_id, folder_id, tags, upload_source = 'web' } = req.body;
 
     if (!client_id)                      return res.status(400).json({ error: 'client_id is required' });
     if (!req.files || !req.files.length) return res.status(400).json({ error: 'No files provided' });
 
-    if (req.profile.role === 'client') {
-      const { data: cu } = await supabase
-        .from('client_users').select('id')
-        .eq('user_id', req.user.id).eq('client_id', client_id).single();
-      if (!cu) return res.status(403).json({ error: 'Access denied to this client' });
-    }
+    // Verify access to this client
+    const allowed = await hasClientAccess(req.user.id, req.profile.role, client_id);
+    if (!allowed) return res.status(403).json({ error: 'Access denied to this client' });
 
     const { data: client, error: clientErr } = await supabase
       .from('clients').select('name').eq('id', client_id).single();
@@ -135,7 +133,7 @@ router.post('/upload', requireAuth, upload.array('files'), async (req, res) => {
             onedrive_path:    `${folderPath}/${odName}`,
             upload_source,
             status:           'pending',
-            tags:             tags ? JSON.parse(tags) : [],
+            tags:             tags ? (() => { try { return JSON.parse(tags); } catch { return []; } })() : [],
           })
           .select().single();
 
@@ -158,7 +156,7 @@ router.post('/upload', requireAuth, upload.array('files'), async (req, res) => {
       }
     }
 
-    await notifyAdmins(client_id, client.name, uploaded.length);
+    await notifyReviewers(client_id, client.name, uploaded.length);
 
     res.status(201).json({
       message:   `${uploaded.length} of ${req.files.length} file(s) uploaded to OneDrive`,
@@ -166,23 +164,21 @@ router.post('/upload', requireAuth, upload.array('files'), async (req, res) => {
     });
   } catch (err) {
     logger.error('Upload route error', { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Failed to upload documents' });
   }
 });
 
 // ── GET /api/documents/:id/download
-router.get('/:id/download', requireAuth, async (req, res) => {
+// All roles can download — access checked per-document
+router.get('/:id/download', requireAuth, validateParams(idParam), async (req, res) => {
   try {
     const { data: doc, error } = await supabase
       .from('documents').select('*').eq('id', req.params.id).single();
     if (error || !doc) return res.status(404).json({ error: 'Document not found' });
 
-    if (req.profile.role === 'client') {
-      const { data: cu } = await supabase
-        .from('client_users').select('id')
-        .eq('user_id', req.user.id).eq('client_id', doc.client_id).single();
-      if (!cu) return res.status(403).json({ error: 'Access denied' });
-    }
+    // Verify access to the document's client
+    const allowed = await hasClientAccess(req.user.id, req.profile.role, doc.client_id);
+    if (!allowed) return res.status(403).json({ error: 'Access denied' });
 
     const downloadUrl = await graph.getDownloadUrl(doc.storage_path);
 
@@ -194,18 +190,15 @@ router.get('/:id/download', requireAuth, async (req, res) => {
     res.json({ url: downloadUrl, expires_in: 3600 });
   } catch (err) {
     logger.error('Download error', { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Failed to generate download link' });
   }
 });
 
 // ── PATCH /api/documents/:id/status
-router.patch('/:id/status', requireAuth, requireAdmin, async (req, res) => {
+// Owner and manager can directly change status
+router.patch('/:id/status', requireAuth, requireRole('owner', 'manager'), validateParams(idParam), validate(updateStatusBody), async (req, res) => {
   try {
     const { status, review_note } = req.body;
-    const valid = ['in_review', 'approved', 'flagged', 'archived'];
-    if (!valid.includes(status)) {
-      return res.status(400).json({ error: `Status must be one of: ${valid.join(', ')}` });
-    }
 
     const { data: doc, error } = await supabase
       .from('documents')
@@ -225,28 +218,43 @@ router.patch('/:id/status', requireAuth, requireAdmin, async (req, res) => {
     res.json({ document: doc });
   } catch (err) {
     logger.error('Status update error', { error: err.message });
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Failed to update document status' });
   }
 });
 
 // ── DELETE /api/documents/:id
-router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
+// Owner only
+router.delete('/:id', requireAuth, requireRole('owner'), validateParams(idParam), async (req, res) => {
   try {
     await supabase.from('documents').update({ status: 'archived' }).eq('id', req.params.id);
     res.json({ message: 'Document archived in DocVault. File remains in OneDrive.' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error('Archive document error', { error: err.message });
+    res.status(500).json({ error: 'Failed to archive document' });
   }
 });
 
 // ── Helpers
-async function notifyAdmins(clientId, clientName, count) {
+// Notify all owners and managers assigned to this client
+async function notifyReviewers(clientId, clientName, count) {
   try {
-    const { data: admins } = await supabase.from('profiles').select('id').eq('role', 'admin');
-    if (!admins?.length) return;
+    // Get owners (see everything)
+    const { data: owners } = await supabase.from('profiles').select('id').eq('role', 'owner');
+    // Get managers assigned to this client
+    const { data: managers } = await supabase
+      .from('staff_client_assignments')
+      .select('user_id, profiles!user_id(role)')
+      .eq('client_id', clientId);
+    const managerIds = (managers || [])
+      .filter(m => m.profiles?.role === 'manager')
+      .map(m => m.user_id);
+
+    const recipientIds = [...new Set([...(owners || []).map(o => o.id), ...managerIds])];
+    if (!recipientIds.length) return;
+
     await supabase.from('notifications').insert(
-      admins.map(a => ({
-        user_id: a.id, title: 'New Document Upload',
+      recipientIds.map(id => ({
+        user_id: id, title: 'New Document Upload',
         body: `${clientName} uploaded ${count} file(s) — ready for review. Check OneDrive.`,
         type: 'upload', reference_id: clientId,
       }))

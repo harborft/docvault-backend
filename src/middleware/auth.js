@@ -1,6 +1,12 @@
 const supabase = require('../config/supabase');
 const logger   = require('../utils/logger');
 
+// ── All valid roles, ordered by privilege level (highest first)
+const ROLES = ['owner', 'manager', 'staff_accountant', 'readonly_reviewer', 'client'];
+
+// ── Internal (non-client) roles
+const INTERNAL_ROLES = ['owner', 'manager', 'staff_accountant', 'readonly_reviewer'];
+
 // Verifies the user's JWT from Supabase Auth
 // Attaches req.user and req.profile to every protected request
 async function requireAuth(req, res, next) {
@@ -39,33 +45,56 @@ async function requireAuth(req, res, next) {
   next();
 }
 
-// Only allows admin users through
-function requireAdmin(req, res, next) {
-  if (req.profile?.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  next();
+// ── Role-based access: only allows listed roles through
+// Usage: requireRole('owner', 'manager')
+function requireRole(...allowedRoles) {
+  return (req, res, next) => {
+    if (!allowedRoles.includes(req.profile?.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    next();
+  };
 }
 
-// Checks that a client user can only access their own client's data
+// ── Client-scoped access for any role
+// Owner: always passes (sees everything)
+// Internal staff (manager/staff/reviewer): checks staff_client_assignments
+// Client: checks client_users
 async function requireClientAccess(req, res, next) {
-  const { clientId } = req.params;
+  const clientId = req.params.clientId || req.params.id;
+  const role     = req.profile?.role;
 
-  // Admins bypass this check
-  if (req.profile?.role === 'admin') return next();
+  // Owner bypasses — sees everything
+  if (role === 'owner') return next();
 
-  const { data, error } = await supabase
-    .from('client_users')
-    .select('id')
-    .eq('user_id', req.user.id)
-    .eq('client_id', clientId)
-    .single();
-
-  if (error || !data) {
-    return res.status(403).json({ error: 'You do not have access to this client account' });
+  try {
+    if (role === 'client') {
+      // Client: check client_users table
+      const { data } = await supabase
+        .from('client_users')
+        .select('id')
+        .eq('user_id', req.user.id)
+        .eq('client_id', clientId)
+        .single();
+      if (!data) return res.status(403).json({ error: 'You do not have access to this client account' });
+    } else if (INTERNAL_ROLES.includes(role)) {
+      // Staff/manager/reviewer: check staff_client_assignments
+      const { data } = await supabase
+        .from('staff_client_assignments')
+        .select('id')
+        .eq('user_id', req.user.id)
+        .eq('client_id', clientId)
+        .single();
+      if (!data) return res.status(403).json({ error: 'You are not assigned to this client' });
+    } else {
+      return res.status(403).json({ error: 'Invalid role' });
+    }
+  } catch (err) {
+    logger.error('Client access check error', { error: err.message });
+    return res.status(500).json({ error: 'Authorization error' });
   }
 
   next();
 }
 
-module.exports = { requireAuth, requireAdmin, requireClientAccess };
+module.exports = { requireAuth, requireRole, requireClientAccess, ROLES, INTERNAL_ROLES };

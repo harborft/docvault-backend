@@ -1,5 +1,6 @@
 // utils/audit.js
 const supabase = require('../config/supabase');
+const logger   = require('./logger');
 
 async function logAction({ userId, clientId, documentId, action, metadata = {}, req }) {
   try {
@@ -12,8 +13,8 @@ async function logAction({ userId, clientId, documentId, action, metadata = {}, 
       ip_address:  req?.ip     || null,
       user_agent:  req?.get('user-agent') || null
     });
-  } catch (_err) {
-    // Audit logging should never crash the request
+  } catch (err) {
+    logger.warn('Audit logging failed', { action, error: err.message });
   }
 }
 

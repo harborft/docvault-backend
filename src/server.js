@@ -5,13 +5,15 @@ const cors       = require('cors');
 const rateLimit  = require('express-rate-limit');
 const logger     = require('./utils/logger');
 
-const authRoutes      = require('./routes/auth');
-const clientRoutes    = require('./routes/clients');
-const documentRoutes  = require('./routes/documents');
-const folderRoutes    = require('./routes/folders');
-const requestRoutes   = require('./routes/requests');
-const approvalRoutes  = require('./routes/approvals');
-const auditRoutes     = require('./routes/audit');
+const authRoutes          = require('./routes/auth');
+const clientRoutes        = require('./routes/clients');
+const documentRoutes      = require('./routes/documents');
+const folderRoutes        = require('./routes/folders');
+const requestRoutes       = require('./routes/requests');
+const approvalRoutes      = require('./routes/approvals');
+const auditRoutes         = require('./routes/audit');
+const staffRoutes         = require('./routes/staff');
+const pendingActionRoutes = require('./routes/pending-actions');
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
@@ -49,7 +51,9 @@ const authLimiter = rateLimit({
 });
 
 app.use('/api', generalLimiter);
-// app.use('/api/auth', authLimiter); // Removed because this globally limits `/api/auth/me` to 10 requests / 15 mins
+// Apply strict rate limit only to auth write endpoints (not /me or /notifications)
+app.use('/api/auth/register-client', authLimiter);
+app.use('/api/auth/invite', authLimiter);
 
 
 // ── Body parsing
@@ -66,17 +70,23 @@ app.use((req, _res, next) => {
 });
 
 // ── Routes
-app.use('/api/auth',      authRoutes);
-app.use('/api/clients',   clientRoutes);
-app.use('/api/documents', documentRoutes);
-app.use('/api/folders',   folderRoutes);
-app.use('/api/requests',  requestRoutes);
-app.use('/api/approvals', approvalRoutes);
-app.use('/api/audit',     auditRoutes);
+app.use('/api/auth',            authRoutes);
+app.use('/api/clients',         clientRoutes);
+app.use('/api/documents',       documentRoutes);
+app.use('/api/folders',         folderRoutes);
+app.use('/api/requests',        requestRoutes);
+app.use('/api/approvals',       approvalRoutes);
+app.use('/api/audit',           auditRoutes);
+app.use('/api/staff',           staffRoutes);
+app.use('/api/pending-actions', pendingActionRoutes);
 
 // ── Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/', (_req, res) => {
+  res.json({ name: 'DocVault API', status: 'ok' });
 });
 
 // ── Global error handler
@@ -89,8 +99,21 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   logger.info(`DocVault API running on port ${PORT}`);
 });
+
+// ── Graceful shutdown
+function shutdown(signal) {
+  logger.info(`${signal} received — shutting down gracefully`);
+  server.close(() => {
+    logger.info('HTTP server closed');
+    process.exit(0);
+  });
+  // Force exit after 10s if connections hang
+  setTimeout(() => process.exit(1), 10_000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 module.exports = app;

@@ -1,21 +1,27 @@
 // routes/folders.js
 const express  = require('express');
 const supabase = require('../config/supabase');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requireRole } = require('../middleware/auth');
+const logger   = require('../utils/logger');
+const { scopeToAssigned } = require('../utils/scope');
+const { validate, validateQuery, createFolderBody, folderListQuery } = require('../utils/validation');
 const router   = express.Router();
 
-router.get('/', requireAuth, async (req, res) => {
+// All roles can list folders — scoped to their assigned clients
+router.get('/', requireAuth, validateQuery(folderListQuery), async (req, res) => {
   try {
     const { client_id } = req.query;
     let query = supabase.from('folders').select('*, documents(count)').order('name');
     if (client_id) query = query.eq('client_id', client_id);
+    query = await scopeToAssigned(query, req.user.id, req.profile.role);
     const { data, error } = await query;
     if (error) throw error;
     res.json({ folders: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logger.error('List folders error', { error: err.message }); res.status(500).json({ error: 'Failed to list folders' }); }
 });
 
-router.post('/', requireAuth, requireAdmin, async (req, res) => {
+// Owner and manager can create folders directly
+router.post('/', requireAuth, requireRole('owner', 'manager'), validate(createFolderBody), async (req, res) => {
   try {
     const { client_id, name, description } = req.body;
     const { data, error } = await supabase
@@ -24,7 +30,7 @@ router.post('/', requireAuth, requireAdmin, async (req, res) => {
       .select().single();
     if (error) throw error;
     res.status(201).json({ folder: data });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { logger.error('Create folder error', { error: err.message }); res.status(500).json({ error: 'Failed to create folder' }); }
 });
 
 module.exports = router;
